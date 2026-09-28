@@ -1,0 +1,7 @@
+PROJECT_NAME="speare-legacy-account-import"
+CONTAINER_REPO="/workspace/speare-legacy-account-import"
+GIT_BRANCH="main"
+
+VALIDATE_COMMAND="cargo fmt --check &&
+cargo clippy --all-targets &&
+cargo test"
