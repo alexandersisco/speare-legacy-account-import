@@ -138,7 +138,7 @@ fn validate_manifest(m: &Manifest, requested: &str) -> Result<()> {
     for d in &m.datasets {
         legacy_schema::table(&d.name)?;
         if d.name.is_empty()
-            || !names.insert(&d.name)
+            || !names.insert(d.name.as_str())
             || d.row_count > i64::MAX as u64
             || (d.row_count == 0 && d.max_id != 0)
             || (d.row_count > 0 && d.max_id <= 0)
@@ -147,6 +147,14 @@ fn validate_manifest(m: &Manifest, requested: &str) -> Result<()> {
             return Err(Error::Invalid(format!(
                 "invalid dataset descriptor: {}",
                 d.name
+            )));
+        }
+    }
+    for table in legacy_schema::TABLES {
+        if !names.contains(table.name) {
+            return Err(Error::Invalid(format!(
+                "required legacy dataset {} is missing from manifest",
+                table.name
             )));
         }
     }

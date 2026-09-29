@@ -6,7 +6,7 @@ use std::{
 use serde_json::json;
 use speare_legacy_account_import::{
     Acquirer, AcquisitionOptions, Dataset, Error, LegacySource, Manifest, Page, SourceError,
-    SourceRow, StagedAccount,
+    SourceRow, StagedAccount, required_dataset_names,
 };
 
 #[derive(Clone)]
@@ -41,6 +41,16 @@ impl Fake {
                     })
                     .collect(),
             );
+        }
+        for name in required_dataset_names() {
+            if !rows.contains_key(name) {
+                datasets.push(Dataset {
+                    name: name.into(),
+                    row_count: 0,
+                    max_id: 0,
+                });
+                rows.insert(name.into(), Vec::new());
+            }
         }
         let manifest = Manifest {
             account_id: "account-1".into(),
@@ -83,6 +93,29 @@ fn sample_row(name: &str, id: i64) -> serde_json::Value {
         "TeamResource" => json!({"Id":id, "ResourceId":"11111111-1111-1111-1111-111111111111",
             "ResourceType":null, "OwnerMemberId":"22222222-2222-2222-2222-222222222222",
             "TeamId":"33333333-3333-3333-3333-333333333333", "Created":"2024-02-03T04:05:06.000"}),
+        "SpeareDocs" => json!({"Id":id, "DocId":"11111111-1111-1111-1111-111111111111",
+            "UserId":"account-1", "Title":"Legacy doc", "Subtitle":"Subtitle", "Document":"{\"text\":\"hello\"}",
+            "DocType":1, "Access":1, "Created":"2024-02-03T04:05:06.000",
+            "Modified":"2024-02-04T04:05:06.000", "Published":0, "Search":"",
+            "Updated":"2016-01-01T00:00:00.000", "Deleted":0, "RegCode":"ABCDEFGH",
+            "OrderList":null, "Revisions":null, "Pinned":null, "ConnectionsCount":2}),
+        "Speare_Blocks" => json!({"Id":id, "UserId":"account-1",
+            "DocId":"11111111-1111-1111-1111-111111111111", "BlockId":"block-1",
+            "Content":"<p>text</p>", "Tags":"[]", "NumOrder":1,
+            "Created":"2024-02-03T04:05:06.000", "Modified":"2024-02-04T04:05:06.000", "Deleted":0}),
+        "SpeareWorkspaces" => json!({"Id":id, "WorkspaceId":"11111111-1111-1111-1111-111111111111",
+            "UserId":"account-1", "Title":"Legacy workspace", "Workstate":"{}", "Pinned":0,
+            "Created":"2024-02-03T04:05:06.000", "Modified":"2024-02-04T04:05:06.000",
+            "Deleted":0, "RegCode":"ABCDEFGH"}),
+        "Speare_WorkspaceTrees" => json!({"Id":id, "UserId":"account-1",
+            "NodeId":"11111111-1111-1111-1111-111111111111", "SpaceId":"22222222-2222-2222-2222-222222222222",
+            "ParentNodeId":"00000000-0000-0000-0000-000000000000", "NodeTitle":"Root",
+            "NodeOrder":1, "NodeCollapsed":false, "NodeHidden":true, "NodeType":"board",
+            "BoardId":"00000000-0000-0000-0000-000000000000", "DocumentId":"00000000-0000-0000-0000-000000000000",
+            "Deleted":0, "Created":"2024-02-03T04:05:06.000", "Modified":"2024-02-04T04:05:06.000",
+            "SecretKey":"test-secret"}),
+        "SpeareUserSettings" => json!({"Id":id, "UserId":"account-1", "Settings":null,
+            "Created":"2024-02-03T04:05:06.000", "Modified":"2024-02-04T04:05:06.000"}),
         _ => panic!("no test fixture for {name}"),
     }
 }
@@ -147,6 +180,16 @@ fn run(fake: Fake, path: &std::path::Path, retries: usize, page_size: usize) -> 
     .map(|_| ())
 }
 
+fn acquired_rows(staged: &StagedAccount, dataset: &str) -> u64 {
+    staged
+        .datasets()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.name == dataset)
+        .unwrap()
+        .acquired_rows
+}
+
 #[test]
 fn ordinary_multiple_empty_and_incremental_read() {
     let temp = tempfile::tempdir().unwrap();
@@ -156,7 +199,7 @@ fn ordinary_multiple_empty_and_incremental_read() {
     let staged = StagedAccount::open(&path).unwrap();
     assert!(staged.is_complete().unwrap());
     let datasets = staged.datasets().unwrap();
-    assert_eq!(datasets.len(), 3);
+    assert_eq!(datasets.len(), required_dataset_names().len());
     assert!(
         datasets
             .iter()
@@ -188,13 +231,13 @@ fn interruption_restarts_from_committed_checkpoint_and_does_not_duplicate() {
         staged.read_rows("Card", 0, 2),
         Err(Error::Incomplete)
     ));
-    assert_eq!(staged.datasets().unwrap()[0].acquired_rows, 2);
+    assert_eq!(acquired_rows(&staged, "Card"), 2);
     drop(staged);
     fake.state.lock().unwrap().fail_at = None;
     run(fake.clone(), &path, 0, 2).unwrap();
     assert_eq!(
-        fake.calls(),
-        vec![
+        &fake.calls()[..4],
+        &[
             ("Card".into(), 0),
             ("Card".into(), 4),
             ("Card".into(), 4),
@@ -224,11 +267,10 @@ fn transient_retry_repeats_request_without_duplicate_rows() {
     fake.state.lock().unwrap().fail_at = None;
     run(fake.clone(), &temp.path().join("db"), 0, 1).unwrap();
     assert_eq!(
-        StagedAccount::open(temp.path().join("db"))
-            .unwrap()
-            .datasets()
-            .unwrap()[0]
-            .acquired_rows,
+        acquired_rows(
+            &StagedAccount::open(temp.path().join("db")).unwrap(),
+            "Card"
+        ),
         1
     );
 }
@@ -309,11 +351,10 @@ fn large_account_stays_in_small_pages() {
     run(fake.clone(), &temp.path().join("db"), 0, 64).unwrap();
     assert!(fake.calls().len() >= 157);
     assert_eq!(
-        StagedAccount::open(temp.path().join("db"))
-            .unwrap()
-            .datasets()
-            .unwrap()[0]
-            .acquired_rows,
+        acquired_rows(
+            &StagedAccount::open(temp.path().join("db")).unwrap(),
+            "Card"
+        ),
         10_000
     );
 }
@@ -354,7 +395,7 @@ fn changed_manifest_after_partially_staged_page_is_not_discarded() {
     fake.state.lock().unwrap().manifest.datasets[0].row_count = 3;
     assert!(matches!(run(fake, &path, 0, 1), Err(Error::Conflict(_))));
     assert_eq!(
-        StagedAccount::open(path).unwrap().datasets().unwrap()[0].acquired_rows,
+        acquired_rows(&StagedAccount::open(path).unwrap(), "Card"),
         1
     );
 }
@@ -433,7 +474,7 @@ fn missing_extra_and_wrong_typed_columns_do_not_commit_page() {
         drop(s);
         assert!(matches!(run(fake, &path, 0, 10), Err(Error::Invalid(_))));
         assert_eq!(
-            StagedAccount::open(path).unwrap().datasets().unwrap()[0].acquired_rows,
+            acquired_rows(&StagedAccount::open(path).unwrap(), "Card"),
             0
         );
     }
@@ -448,4 +489,83 @@ fn unknown_legacy_table_is_not_silently_staged_as_json() {
         run(fake, &temp.path().join("db"), 0, 10),
         Err(Error::Invalid(_))
     ));
+}
+
+#[test]
+fn missing_v4_or_v5_dataset_blocks_completion() {
+    for missing in ["SpeareDocs", "SpeareUserSettings", "Card", "Workspace"] {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(&[("Card", 0)]);
+        fake.state
+            .lock()
+            .unwrap()
+            .manifest
+            .datasets
+            .retain(|d| d.name != missing);
+        assert!(matches!(
+            run(fake, &temp.path().join("db"), 0, 10),
+            Err(Error::Invalid(_))
+        ));
+    }
+}
+
+#[test]
+fn all_five_dbo_tables_stage_real_columns_and_distinct_bit_and_int_flags() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("db");
+    let fake = Fake::new(&[
+        ("SpeareDocs", 1),
+        ("Speare_Blocks", 1),
+        ("SpeareWorkspaces", 1),
+        ("Speare_WorkspaceTrees", 1),
+        ("SpeareUserSettings", 1),
+    ]);
+    run(fake, &path, 0, 2).unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let (document, pinned): (String, Option<i64>) = db
+        .query_row(
+            "SELECT \"Document\", \"Pinned\" FROM \"SpeareDocs\"",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(document, "{\"text\":\"hello\"}");
+    assert_eq!(pinned, None);
+    let count: i64 = db
+        .query_row(
+            "SELECT count(*) FROM \"Speare_Blocks\" WHERE \"Deleted\"=0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    let title: String = db
+        .query_row("SELECT \"Title\" FROM \"SpeareWorkspaces\"", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(title, "Legacy workspace");
+    let tree: (i64, i64, String) = db
+        .query_row(
+            "SELECT \"NodeHidden\", \"Deleted\", \"SecretKey\" FROM \"Speare_WorkspaceTrees\"",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(tree, (1, 0, "test-secret".into()));
+    let settings: Option<String> = db
+        .query_row("SELECT \"Settings\" FROM \"SpeareUserSettings\"", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(settings, None);
+    let staged = StagedAccount::open(path).unwrap();
+    assert_eq!(
+        staged.read_rows("Speare_WorkspaceTrees", 0, 1).unwrap()[0].data["NodeHidden"],
+        true
+    );
+    assert_eq!(
+        staged.read_rows("Speare_WorkspaceTrees", 0, 1).unwrap()[0].data["Deleted"],
+        0
+    );
 }

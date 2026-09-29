@@ -24,20 +24,23 @@ Returns the *complete* dataset catalog for this account and one stable export vi
   "datasets": [
     {"name":"SpeareUser", "row_count":1, "max_id":47},
     {"name":"Card", "row_count":2, "max_id":203},
-    {"name":"CardSnapshot", "row_count":0, "max_id":0}
+    {"name":"CardSnapshot", "row_count":0, "max_id":0},
+    {"name":"SpeareDocs", "row_count":0, "max_id":0},
+    {"name":"Speare_Blocks", "row_count":0, "max_id":0},
+    {"name":"SpeareWorkspaces", "row_count":0, "max_id":0},
+    {"name":"Speare_WorkspaceTrees", "row_count":0, "max_id":0},
+    {"name":"SpeareUserSettings", "row_count":1, "max_id":201}
   ]
 }
 ```
 
-Dataset names are opaque case-sensitive strings, not raw client-provided SQL identifiers. The
-server has an allowlisted dataset catalog and the server determines all account-related rows,
-including rows in tables whose ownership requires joining other legacy tables. **The final
-required catalog remains a migration-requirements decision.** Start by reviewing user-owned
-content (`SpeareUser`, `Card`, `Workspace`, `Folder`, `Stack`, `Board`, settings, snapshots,
-links, etc.); do not blindly export administrative, derived/search, authentication/token, or
-payment records just because they occur in the schema. `Image` contains blob references, not
-necessarily the image bytes: if actual binaries must migrate, they need a separate bounded
-binary export contract, not an assertion that the SQL row alone is sufficient.
+Dataset names are opaque case-sensitive strings, not raw client-provided SQL identifiers. Every
+V4 (`dbo`) and V5 (`andrew`) table in `legacy-sql-server-schema.sql` must be listed for every
+export, even when empty; the client refuses a manifest missing one. The server has an allowlisted
+dataset catalog and determines all account-related rows, including rows in tables whose ownership
+requires joining other legacy tables. `Image` contains blob references, not necessarily the image
+bytes: if actual binaries must migrate, they need a separate bounded binary export contract, not
+an assertion that the SQL row alone is sufficient.
 
 The manifest must include empty required datasets. `row_count` is the exact number of visible
 rows (including `Deleted` tombstones); `max_id` is the greatest SQL Server identity `Id`, or
@@ -53,8 +56,8 @@ filter out deleted rows. A response:
 ```json
 {
   "rows": [
-    {"id":201, "data":{"Id":201,"CardId":"guid","UserId":"legacy-user-guid",
-                       "Title":"Example","Content":"[]","Deleted":false}}
+    {"id":201, "data":{"Id":201,"UserId":"legacy-user-guid","Settings":null,
+                       "Created":"2024-02-03T04:05:06.000","Modified":"2024-02-04T04:05:06.000"}}
   ],
   "complete": false
 }
@@ -95,9 +98,13 @@ the old file intact and reports a conflict: create a *new* staging file only aft
 the change. Once complete, downstream reads require no network; staged rows are available via
 `StagedAccount::open`, `datasets`, and bounded `read_rows` calls. The SQLite tables are generated
 from the checked-in SQL Server schema reference at build time: `INT`/`BIT` become `INTEGER`,
-GUID/date/text become `TEXT`, with required columns, primary IDs, and bit checks. SQLite cannot
+GUID/date/text (`NCHAR` included) become `TEXT`, with required columns, primary IDs, and bit checks.
+SQL Server schema names (`andrew`, `dbo`) are flattened to unqualified SQLite table names; a
+duplicate table name across schemas fails the build. SQLite cannot
 reproduce SQL Server `NVARCHAR` length, `DATETIME` storage, defaults, or database-level behavior;
-the API's lossless encoding rules remain necessary. Unknown tables and missing/extra/ill-typed
+the API's lossless encoding rules remain necessary. In the new `[dbo]` tables, `Deleted` is `INT`,
+not `BIT`; `NodeCollapsed` and `NodeHidden` are `BIT`. `Speare_WorkspaceTrees.SecretKey` is
+sensitive and must be protected both in transit and in the staging file. Unknown tables and missing/extra/ill-typed
 columns fail closed. To add a discovered dataset, add its definition to the reference schema,
 review ownership/export rules, and update the server catalog. The staging file contains
 customer data and should be stored in an access-controlled directory and removed according to

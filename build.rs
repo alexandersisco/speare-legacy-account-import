@@ -1,6 +1,6 @@
 // Generate the SQLite column catalog from the checked-in SQL Server reference. Fail the build
 // for an unknown type rather than silently staging a newly discovered column incorrectly.
-use std::{env, fmt::Write, fs, path::PathBuf};
+use std::{collections::HashSet, env, fmt::Write, fs, path::PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=legacy-sql-server-schema.sql");
@@ -10,13 +10,20 @@ fn main() {
     let mut table: Option<String> = None;
     let mut columns = Vec::new();
     let mut tables = 0;
+    let mut names = HashSet::new();
     for line in input.lines() {
         let line = line.trim();
-        if let Some(start) = line.strip_prefix("CREATE TABLE [andrew].[") {
+        if let Some(start) = line.strip_prefix("CREATE TABLE ") {
             assert!(table.is_none(), "nested table definition");
-            table = Some(start.split_once(']').expect("table name").0.to_owned());
+            let start = start.strip_prefix('[').expect("SQL Server schema name");
+            let (_schema, name) = start.split_once("].[").expect("SQL Server table header");
+            table = Some(name.split_once(']').expect("table name").0.to_owned());
         } else if line == ");" && table.is_some() {
             let name = table.take().unwrap();
+            assert!(
+                names.insert(name.clone()),
+                "duplicate table name {name} across SQL schemas; qualify dataset names first"
+            );
             assert!(
                 columns
                     .iter()
@@ -43,6 +50,7 @@ fn main() {
             } else if rest.starts_with("UNIQUEIDENTIFIER ")
                 || rest.starts_with("VARCHAR ")
                 || rest.starts_with("NVARCHAR ")
+                || rest.starts_with("NCHAR ")
                 || rest.starts_with("DATETIME ")
                 || rest.starts_with("DATETIME2 ")
             {

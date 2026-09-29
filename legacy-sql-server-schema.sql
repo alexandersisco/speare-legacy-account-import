@@ -14,6 +14,101 @@ CREATE TABLE [andrew].[Board] (
 
 GO
 
+CREATE TABLE [dbo].[SpeareDocs] (
+    [Id]               INT              IDENTITY (1, 1) NOT NULL,
+    [DocId]            UNIQUEIDENTIFIER DEFAULT (newid()) NOT NULL,
+    [UserId]           UNIQUEIDENTIFIER NOT NULL,
+    [Title]            NVARCHAR (150)   DEFAULT ('?') NOT NULL,
+    [Subtitle]         NVARCHAR (500)   DEFAULT ('?') NOT NULL,
+    [Document]         NVARCHAR (MAX)   DEFAULT ('?') NOT NULL,
+    [DocType]          INT              DEFAULT ((1)) NOT NULL,
+    [Access]           INT              DEFAULT ((1)) NOT NULL,
+    [Created]          DATETIME         DEFAULT (getdate()) NOT NULL,
+    [Modified]         DATETIME         DEFAULT (getdate()) NOT NULL,
+    [Published]        INT              DEFAULT ((0)) NOT NULL,
+    [Search]           NVARCHAR (MAX)   DEFAULT ('?') NOT NULL,
+    [Updated]          DATETIME         DEFAULT ('1/1/2016') NOT NULL,
+    [Deleted]          INT              DEFAULT ((0)) NOT NULL,
+    [RegCode]          NCHAR (8)        DEFAULT (left(newid(),(8))) NOT NULL,
+    [OrderList]        NVARCHAR (MAX)   NULL,
+    [Revisions]        NVARCHAR (MAX)   NULL,
+    [Pinned]           INT              DEFAULT ((0)) NULL,
+    [ConnectionsCount] INT              DEFAULT ((0)) NOT NULL,
+    PRIMARY KEY CLUSTERED ([Id] ASC)
+);
+
+
+GO
+
+CREATE TABLE [dbo].[Speare_Blocks] (
+    [Id]       INT              IDENTITY (1, 1) NOT NULL,
+    [UserId]   UNIQUEIDENTIFIER NOT NULL,
+    [DocId]    UNIQUEIDENTIFIER NOT NULL,
+    [BlockId]  NVARCHAR (40)    DEFAULT (newid()) NOT NULL,
+    [Content]  NVARCHAR (MAX)   DEFAULT ('') NOT NULL,
+    [Tags]     NVARCHAR (MAX)   DEFAULT ('') NOT NULL,
+    [NumOrder] INT              DEFAULT ((1)) NOT NULL,
+    [Created]  DATETIME         DEFAULT (getdate()) NOT NULL,
+    [Modified] DATETIME         DEFAULT (getdate()) NOT NULL,
+    [Deleted]  INT              DEFAULT ((0)) NOT NULL,
+    PRIMARY KEY CLUSTERED ([Id] ASC)
+);
+
+
+GO
+
+CREATE TABLE [dbo].[SpeareWorkspaces] (
+    [Id]          INT              IDENTITY (1, 1) NOT NULL,
+    [WorkspaceId] UNIQUEIDENTIFIER DEFAULT (newid()) NOT NULL,
+    [UserId]      UNIQUEIDENTIFIER NOT NULL,
+    [Title]       NVARCHAR (150)   DEFAULT ('?') NOT NULL,
+    [Workstate]   NVARCHAR (MAX)   DEFAULT ('?') NOT NULL,
+    [Pinned]      INT              DEFAULT ((0)) NOT NULL,
+    [Created]     DATETIME         DEFAULT (getdate()) NOT NULL,
+    [Modified]    DATETIME         DEFAULT (getdate()) NOT NULL,
+    [Deleted]     INT              DEFAULT ((0)) NOT NULL,
+    [RegCode]     NCHAR (8)        DEFAULT (left(newid(),(8))) NOT NULL,
+    PRIMARY KEY CLUSTERED ([Id] ASC)
+);
+
+
+GO
+
+CREATE TABLE [dbo].[Speare_WorkspaceTrees] (
+    [Id]            INT              IDENTITY (1, 1) NOT NULL,
+    [UserId]        UNIQUEIDENTIFIER NOT NULL,
+    [NodeId]        UNIQUEIDENTIFIER NOT NULL,
+    [SpaceId]       UNIQUEIDENTIFIER NOT NULL,
+    [ParentNodeId]  UNIQUEIDENTIFIER DEFAULT (CONVERT([uniqueidentifier],CONVERT([binary],(0)))) NOT NULL,
+    [NodeTitle]     NVARCHAR (250)   DEFAULT ('Untitled') NOT NULL,
+    [NodeOrder]     INT              DEFAULT ((1)) NOT NULL,
+    [NodeCollapsed] BIT              DEFAULT ((0)) NOT NULL,
+    [NodeHidden]    BIT              DEFAULT ((0)) NOT NULL,
+    [NodeType]      VARCHAR (20)     DEFAULT ('board') NOT NULL,
+    [BoardId]       UNIQUEIDENTIFIER DEFAULT (CONVERT([uniqueidentifier],CONVERT([binary],(0)))) NOT NULL,
+    [DocumentId]    UNIQUEIDENTIFIER DEFAULT (CONVERT([uniqueidentifier],CONVERT([binary],(0)))) NOT NULL,
+    [Deleted]       INT              DEFAULT ((0)) NOT NULL,
+    [Created]       DATETIME         DEFAULT (getdate()) NOT NULL,
+    [Modified]      DATETIME         DEFAULT (getdate()) NOT NULL,
+    [SecretKey]     VARCHAR (40)     DEFAULT (CONVERT([varchar](100),hashbytes('SHA2_256',CONVERT([binary],newid())))) NOT NULL,
+    PRIMARY KEY CLUSTERED ([Id] ASC)
+);
+
+
+GO
+
+CREATE TABLE [dbo].[SpeareUserSettings] (
+    [Id]       INT            IDENTITY (1, 1) NOT NULL,
+    [UserId]   NVARCHAR (40)  NOT NULL,
+    [Settings] NVARCHAR (MAX) NULL,
+    [Created]  DATETIME       DEFAULT (getdate()) NOT NULL,
+    [Modified] DATETIME       DEFAULT (getdate()) NOT NULL,
+    PRIMARY KEY CLUSTERED ([Id] ASC)
+);
+
+
+GO
+
 CREATE TABLE [andrew].[CardSettings] (
     [Id]                  INT              IDENTITY (1, 1) NOT NULL,
     [CardId]              UNIQUEIDENTIFIER NOT NULL,
@@ -486,4 +581,3 @@ CREATE TABLE [andrew].[Workspace] (
 
 
 GO
-

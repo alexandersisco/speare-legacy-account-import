@@ -5,8 +5,9 @@ connect to SQL Server or convert the rows into the current Speare model. See
 [`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md) for boundaries and [`MIGRATION_API.md`](MIGRATION_API.md)
 for the proposed, not-yet-implemented server contract and its consistency precondition.
 The staging SQLite file has tables named for the legacy tables, with the columns and compatible
-SQLite types generated from `legacy-sql-server-schema.sql`. Only manifest-selected datasets are
-downloaded. Acquisition metadata and checkpoints live in separate tables.
+SQLite types generated from `legacy-sql-server-schema.sql`. Every V4 (`dbo`) and V5 (`andrew`)
+table in that reference is required in the server manifest, including empty tables. Acquisition
+metadata and checkpoints live in separate tables.
 
 ```rust,no_run
 use speare_legacy_account_import::{Acquirer, HttpLegacySource, StagedAccount};

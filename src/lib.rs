@@ -12,6 +12,11 @@ pub use http::HttpLegacySource;
 pub use source::{Dataset, LegacySource, Manifest, Page, SourceError, SourceRow};
 pub use staging::{StagedAccount, StagedDataset, StagedRow};
 
+/// Every V4 (`dbo`) and V5 (`andrew`) dataset required in a complete server manifest.
+pub fn required_dataset_names() -> impl ExactSizeIterator<Item = &'static str> {
+    legacy_schema::TABLES.iter().map(|table| table.name)
+}
+
 /// Errors are deliberately distinguishable: an interrupted acquisition remains resumable;
 /// an invalid response or changed manifest requires investigation rather than a blind retry.
 #[derive(Debug, thiserror::Error)]
