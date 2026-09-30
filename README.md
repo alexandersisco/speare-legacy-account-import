@@ -43,3 +43,22 @@ Reinvoke `acquire` with the same path after interruption; committed pages are no
 Open a completed staging file without the network for downstream reruns. Store it in an
 access-controlled location: it contains customer data. Implement `LegacySource` to test against
 an in-memory/fake export; integration tests in `tests/acquisition.rs` demonstrate this.
+
+## Exporter test CLI
+
+The included CLI runs a complete acquisition against an exporter and reports the validated count
+for every dataset. It reads the bearer token from the environment rather than a command-line
+argument:
+
+```sh
+export SPEARE_MIGRATION_BEARER_TOKEN='...'
+cargo run --bin speare-import-test -- \
+  --base-url https://speare.example \
+  --endpoint-prefix /api/migration/export/v1 \
+  --account-id local-account-key \
+  --run-id test-run-1 \
+  --staging ./speare-test.sqlite
+```
+
+The account and run IDs are local safety boundaries and are never sent to the exporter. Reuse all
+three local values to test restart/resume; choose a new run ID and staging file for a fresh test.
