@@ -1,38 +1,54 @@
 use serde::{Deserialize, Serialize};
 
-/// Manifest is the complete, authoritative list of required datasets for this export.
-/// `export_id` names a stable source view; a changed view must use a different ID.
+/// Complete metadata for the authenticated account's continuously frozen source view.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
-    pub account_id: String,
-    pub export_id: String,
     pub datasets: Vec<Dataset>,
+    pub pagination: Pagination,
+    pub consistency: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pagination {
+    pub default_limit: usize,
+    pub max_limit: usize,
+    pub continuation: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Dataset {
     pub name: String,
+    pub source_table: String,
+    pub ownership: String,
+    pub fields: Vec<Field>,
+    pub key: String,
+    pub order: String,
     pub row_count: u64,
-    /// Inclusive upper bound on legacy SQL Server `Id`; 0 for an empty dataset.
-    pub max_id: i64,
+    /// Largest SQL `INT` Id, or `None` for an empty dataset.
+    pub max_id: Option<i32>,
 }
 
-/// The payload contains all legacy column names and values, including `Id`. Large NVARCHAR
-/// fields are opaque strings (not parsed into a modern model).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SourceRow {
-    pub id: i64,
-    pub data: serde_json::Value,
+pub struct Field {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub source_type: String,
+    pub nullable: bool,
 }
+
+/// Rows are unwrapped JSON objects containing every original legacy column.
+pub type SourceRow = serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Page {
+    pub dataset: String,
     pub rows: Vec<SourceRow>,
-    /// True iff there are no more rows in this dataset's export view after this page.
+    pub next_after_id: Option<i32>,
     pub complete: bool,
 }
 
@@ -44,16 +60,14 @@ pub enum SourceError {
     Permanent(String),
 }
 
-/// A fake can implement this trait without HTTP. Calls must be repeatable; after_id is exclusive.
-/// An export must remain stable across process restarts or return an error, never silently change.
+/// A fake can implement this trait without HTTP. The authenticated account is resolved by the
+/// source; account and run identifiers are deliberately not sent through this interface.
 pub trait LegacySource {
-    fn manifest(&self, account_id: &str) -> std::result::Result<Manifest, SourceError>;
+    fn manifest(&self) -> std::result::Result<Manifest, SourceError>;
     fn page(
         &self,
-        account_id: &str,
-        export_id: &str,
         dataset: &str,
-        after_id: i64,
+        after_id: Option<i32>,
         limit: usize,
     ) -> std::result::Result<Page, SourceError>;
 }

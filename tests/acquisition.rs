@@ -5,8 +5,8 @@ use std::{
 
 use serde_json::json;
 use speare_legacy_account_import::{
-    Acquirer, AcquisitionOptions, Dataset, Error, LegacySource, Manifest, Page, SourceError,
-    SourceRow, StagedAccount, required_dataset_names,
+    Acquirer, AcquisitionOptions, Dataset, Error, Field, LegacySource, Manifest, Page, Pagination,
+    SourceError, SourceRow, StagedAccount, required_dataset_names,
 };
 
 #[derive(Clone)]
@@ -17,45 +17,43 @@ struct Fake {
 struct State {
     manifest: Manifest,
     rows: BTreeMap<String, Vec<SourceRow>>,
-    calls: Vec<(String, i64)>,
-    fail_at: Option<(String, i64, bool)>, // after_id, transient?
+    calls: Vec<(String, Option<i32>)>,
+    fail_at: Option<(String, Option<i32>, bool)>, // after_id, transient?
     malformed: Option<Page>,
 }
 
 impl Fake {
     fn new(sizes: &[(&str, usize)]) -> Self {
-        let mut datasets = Vec::new();
+        let specs = schema_specs();
+        let requested = sizes.iter().copied().collect::<BTreeMap<_, _>>();
         let mut rows = BTreeMap::new();
-        for (name, n) in sizes {
-            datasets.push(Dataset {
-                name: (*name).into(),
-                row_count: *n as u64,
-                max_id: *n as i64 * 2,
-            });
-            rows.insert(
-                (*name).into(),
-                (1..=*n)
-                    .map(|i| SourceRow {
-                        id: i as i64 * 2,
-                        data: sample_row(name, i as i64 * 2),
-                    })
-                    .collect(),
-            );
-        }
+        let mut datasets = Vec::new();
         for name in required_dataset_names() {
-            if !rows.contains_key(name) {
-                datasets.push(Dataset {
-                    name: name.into(),
-                    row_count: 0,
-                    max_id: 0,
-                });
-                rows.insert(name.into(), Vec::new());
-            }
+            let n = requested.get(name).copied().unwrap_or(0);
+            rows.insert(
+                name.into(),
+                (1..=n).map(|i| sample_row(name, i as i64 * 2)).collect(),
+            );
+            let (source_table, fields) = specs.get(name).unwrap().clone();
+            datasets.push(Dataset {
+                name: name.into(),
+                source_table,
+                ownership: "authenticated account ownership rule".into(),
+                fields,
+                key: "Id".into(),
+                order: "ascending".into(),
+                row_count: n as u64,
+                max_id: (n > 0).then_some(n as i32 * 2),
+            });
         }
         let manifest = Manifest {
-            account_id: "account-1".into(),
-            export_id: "view-1".into(),
             datasets,
+            pagination: Pagination {
+                default_limit: 100,
+                max_limit: 1000,
+                continuation: "exclusive after_id".into(),
+            },
+            consistency: "application-quiesced".into(),
         };
         Self {
             state: Arc::new(Mutex::new(State {
@@ -68,13 +66,48 @@ impl Fake {
         }
     }
 
-    fn fail(&self, dataset: &str, after: i64, transient: bool) {
+    fn fail(&self, dataset: &str, after: Option<i32>, transient: bool) {
         self.state.lock().unwrap().fail_at = Some((dataset.into(), after, transient));
     }
 
-    fn calls(&self) -> Vec<(String, i64)> {
+    fn calls(&self) -> Vec<(String, Option<i32>)> {
         self.state.lock().unwrap().calls.clone()
     }
+
+    fn calls_for(&self, dataset: &str) -> Vec<(String, Option<i32>)> {
+        self.calls()
+            .into_iter()
+            .filter(|call| call.0 == dataset)
+            .collect()
+    }
+}
+
+fn schema_specs() -> BTreeMap<String, (String, Vec<Field>)> {
+    let mut result = BTreeMap::new();
+    let mut current: Option<(String, String, Vec<Field>)> = None;
+    for raw in include_str!("../legacy-sql-server-schema.sql").lines() {
+        let line = raw.trim();
+        if let Some(header) = line.strip_prefix("CREATE TABLE [") {
+            let (schema, rest) = header.split_once("].[").unwrap();
+            let name = rest.split_once(']').unwrap().0;
+            current = Some((schema.into(), name.into(), Vec::new()));
+        } else if line == ");" {
+            if let Some((schema, name, fields)) = current.take() {
+                result.insert(name.clone(), (format!("{schema}.{name}"), fields));
+            }
+        } else if let Some((_, _, fields)) = current.as_mut()
+            && let Some(column) = line.strip_prefix('[')
+        {
+            let (name, rest) = column.split_once(']').unwrap();
+            let rest = rest.trim_start();
+            fields.push(Field {
+                name: name.into(),
+                source_type: rest.split_whitespace().next().unwrap().into(),
+                nullable: !rest.contains("NOT NULL"),
+            });
+        }
+    }
+    result
 }
 
 fn sample_row(name: &str, id: i64) -> serde_json::Value {
@@ -121,22 +154,12 @@ fn sample_row(name: &str, id: i64) -> serde_json::Value {
 }
 
 impl LegacySource for Fake {
-    fn manifest(&self, _: &str) -> Result<Manifest, SourceError> {
+    fn manifest(&self) -> Result<Manifest, SourceError> {
         Ok(self.state.lock().unwrap().manifest.clone())
     }
 
-    fn page(
-        &self,
-        _: &str,
-        export: &str,
-        dataset: &str,
-        after: i64,
-        limit: usize,
-    ) -> Result<Page, SourceError> {
+    fn page(&self, dataset: &str, after: Option<i32>, limit: usize) -> Result<Page, SourceError> {
         let mut s = self.state.lock().unwrap();
-        if s.manifest.export_id != export {
-            return Err(SourceError::Permanent("invalid export".into()));
-        }
         s.calls.push((dataset.into(), after));
         if let Some((name, at, transient)) = &s.fail_at
             && name == dataset
@@ -157,14 +180,22 @@ impl LegacySource for Fake {
             .ok_or_else(|| SourceError::Permanent("unknown dataset".into()))?;
         let rows: Vec<_> = all
             .iter()
-            .filter(|r| r.id > after)
+            .filter(|row| after.is_none_or(|after| row["Id"].as_i64().unwrap() > i64::from(after)))
             .take(limit)
             .cloned()
             .collect();
-        let complete = rows
-            .last()
-            .is_none_or(|last| last.id == all.last().unwrap().id);
-        Ok(Page { rows, complete })
+        let complete = rows.last().is_none_or(|last| {
+            all.last()
+                .is_none_or(|final_row| last["Id"] == final_row["Id"])
+        });
+        let next_after_id =
+            (!complete).then(|| rows.last().unwrap()["Id"].as_i64().unwrap() as i32);
+        Ok(Page {
+            dataset: dataset.into(),
+            rows,
+            next_after_id,
+            complete,
+        })
     }
 }
 
@@ -176,7 +207,7 @@ fn run(fake: Fake, path: &std::path::Path, retries: usize, page_size: usize) -> 
             page_size,
         },
     )?
-    .acquire("account-1", path)
+    .acquire("account-1", "run-1", path)
     .map(|_| ())
 }
 
@@ -205,11 +236,11 @@ fn ordinary_multiple_empty_and_incremental_read() {
             .iter()
             .all(|d| d.complete && d.expected_rows == d.acquired_rows)
     );
-    assert!(staged.read_rows("DocSettings", 0, 2).unwrap().is_empty());
-    let first = staged.read_rows("Card", 0, 2).unwrap();
+    assert!(staged.read_rows("DocSettings", None, 2).unwrap().is_empty());
+    let first = staged.read_rows("Card", None, 2).unwrap();
     assert_eq!(first.iter().map(|r| r.id).collect::<Vec<_>>(), vec![2, 4]);
     assert_eq!(first[0].data["Content"], "[]");
-    assert_eq!(staged.read_rows("Card", 4, 2).unwrap()[0].id, 6);
+    assert_eq!(staged.read_rows("Card", Some(4), 2).unwrap()[0].id, 6);
     let before = fake.calls().len();
     run(fake.clone(), &path, 0, 2).unwrap();
     assert_eq!(fake.calls().len(), before); // offline success needs no source
@@ -220,7 +251,7 @@ fn interruption_restarts_from_committed_checkpoint_and_does_not_duplicate() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("staging.db");
     let fake = Fake::new(&[("Card", 5)]);
-    fake.fail("Card", 4, false);
+    fake.fail("Card", Some(4), false);
     assert!(matches!(
         run(fake.clone(), &path, 0, 2),
         Err(Error::Source(_))
@@ -228,7 +259,7 @@ fn interruption_restarts_from_committed_checkpoint_and_does_not_duplicate() {
     let staged = StagedAccount::open(&path).unwrap();
     assert!(!staged.is_complete().unwrap());
     assert!(matches!(
-        staged.read_rows("Card", 0, 2),
+        staged.read_rows("Card", None, 2),
         Err(Error::Incomplete)
     ));
     assert_eq!(acquired_rows(&staged, "Card"), 2);
@@ -236,18 +267,18 @@ fn interruption_restarts_from_committed_checkpoint_and_does_not_duplicate() {
     fake.state.lock().unwrap().fail_at = None;
     run(fake.clone(), &path, 0, 2).unwrap();
     assert_eq!(
-        &fake.calls()[..4],
+        &fake.calls_for("Card")[..4],
         &[
-            ("Card".into(), 0),
-            ("Card".into(), 4),
-            ("Card".into(), 4),
-            ("Card".into(), 8)
+            ("Card".into(), None),
+            ("Card".into(), Some(4)),
+            ("Card".into(), Some(4)),
+            ("Card".into(), Some(8))
         ]
     );
     assert_eq!(
         StagedAccount::open(&path)
             .unwrap()
-            .read_rows("Card", 0, 100)
+            .read_rows("Card", None, 100)
             .unwrap()
             .len(),
         5
@@ -258,12 +289,12 @@ fn interruption_restarts_from_committed_checkpoint_and_does_not_duplicate() {
 fn transient_retry_repeats_request_without_duplicate_rows() {
     let temp = tempfile::tempdir().unwrap();
     let fake = Fake::new(&[("Card", 1)]);
-    fake.fail("Card", 0, true);
+    fake.fail("Card", None, true);
     assert!(matches!(
         run(fake.clone(), &temp.path().join("db"), 1, 1),
         Err(Error::Source(_))
     ));
-    assert_eq!(fake.calls().len(), 2);
+    assert_eq!(fake.calls_for("Card").len(), 2);
     fake.state.lock().unwrap().fail_at = None;
     run(fake.clone(), &temp.path().join("db"), 0, 1).unwrap();
     assert_eq!(
@@ -276,37 +307,66 @@ fn transient_retry_repeats_request_without_duplicate_rows() {
 }
 
 #[test]
+fn first_page_has_no_sentinel_and_negative_sql_int_ids_resume() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake = Fake::new(&[("Card", 3)]);
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.rows.insert(
+            "Card".into(),
+            [-3, -2, -1]
+                .into_iter()
+                .map(|id| sample_row("Card", id))
+                .collect(),
+        );
+        let card = state
+            .manifest
+            .datasets
+            .iter_mut()
+            .find(|dataset| dataset.name == "Card")
+            .unwrap();
+        card.max_id = Some(-1);
+    }
+    run(fake.clone(), &temp.path().join("db"), 0, 2).unwrap();
+    assert_eq!(
+        fake.calls_for("Card"),
+        vec![("Card".into(), None), ("Card".into(), Some(-2))]
+    );
+    let rows = StagedAccount::open(temp.path().join("db"))
+        .unwrap()
+        .read_rows("Card", None, 10)
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        [-3, -2, -1]
+    );
+}
+
+#[test]
 fn malformed_order_duplicate_and_premature_completion_are_rejected() {
     for page in [
         Page {
-            rows: vec![
-                SourceRow {
-                    id: 2,
-                    data: json!({"Id":2}),
-                },
-                SourceRow {
-                    id: 2,
-                    data: json!({"Id":2}),
-                },
-            ],
+            dataset: "Card".into(),
+            rows: vec![json!({"Id":2}), json!({"Id":2})],
+            next_after_id: Some(2),
             complete: false,
         },
         Page {
-            rows: vec![SourceRow {
-                id: 2,
-                data: json!({"Id":999}),
-            }],
+            dataset: "Wrong".into(),
+            rows: vec![json!({"Id":2})],
+            next_after_id: Some(2),
             complete: false,
         },
         Page {
-            rows: vec![SourceRow {
-                id: 2,
-                data: json!({"Id":2}),
-            }],
+            dataset: "Card".into(),
+            rows: vec![json!({"Id":2})],
+            next_after_id: None,
             complete: true,
         },
         Page {
+            dataset: "Card".into(),
             rows: vec![],
+            next_after_id: Some(0),
             complete: false,
         },
     ] {
@@ -331,15 +391,19 @@ fn manifest_changes_and_wrong_account_cannot_reuse_a_partial_file() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("db");
     let fake = Fake::new(&[("Card", 3)]);
-    fake.fail("Card", 0, false);
+    fake.fail("Card", None, false);
     run(fake.clone(), &path, 0, 2).unwrap_err();
-    fake.state.lock().unwrap().manifest.export_id = "view-2".into();
+    fake.state.lock().unwrap().manifest.datasets[0].ownership = "changed rule".into();
     assert!(matches!(
         run(fake.clone(), &path, 0, 2),
         Err(Error::Conflict(_))
     ));
     assert!(matches!(
-        Acquirer::new(fake).acquire("other", &path),
+        Acquirer::new(fake.clone()).acquire("other", "run-1", &path),
+        Err(Error::Conflict(_))
+    ));
+    assert!(matches!(
+        Acquirer::new(fake).acquire("account-1", "run-2", &path),
         Err(Error::Conflict(_))
     ));
 }
@@ -366,10 +430,16 @@ fn inflated_manifest_count_or_max_id_cannot_complete() {
         let fake = Fake::new(&[("Card", 2)]);
         {
             let mut state = fake.state.lock().unwrap();
+            let dataset = state
+                .manifest
+                .datasets
+                .iter_mut()
+                .find(|dataset| dataset.name == "Card")
+                .unwrap();
             if alter == "count" {
-                state.manifest.datasets[0].row_count = 3;
+                dataset.row_count = 3;
             } else {
-                state.manifest.datasets[0].max_id = 6;
+                dataset.max_id = Some(6);
             }
         }
         assert!(matches!(
@@ -390,9 +460,17 @@ fn changed_manifest_after_partially_staged_page_is_not_discarded() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("db");
     let fake = Fake::new(&[("Card", 2)]);
-    fake.fail("Card", 2, false);
+    fake.fail("Card", Some(2), false);
     run(fake.clone(), &path, 0, 1).unwrap_err();
-    fake.state.lock().unwrap().manifest.datasets[0].row_count = 3;
+    fake.state
+        .lock()
+        .unwrap()
+        .manifest
+        .datasets
+        .iter_mut()
+        .find(|dataset| dataset.name == "Card")
+        .unwrap()
+        .row_count = 3;
     assert!(matches!(run(fake, &path, 0, 1), Err(Error::Conflict(_))));
     assert_eq!(
         acquired_rows(&StagedAccount::open(path).unwrap(), "Card"),
@@ -437,11 +515,11 @@ fn rows_are_staged_in_legacy_named_typed_tables() {
     assert_eq!(image_size, 123);
     let staged = StagedAccount::open(path).unwrap();
     assert_eq!(
-        staged.read_rows("TeamResource", 0, 1).unwrap()[0].data["ResourceType"],
+        staged.read_rows("TeamResource", None, 1).unwrap()[0].data["ResourceType"],
         serde_json::Value::Null
     );
     assert_eq!(
-        staged.read_rows("Card", 0, 1).unwrap()[0].data["Deleted"],
+        staged.read_rows("Card", None, 1).unwrap()[0].data["Deleted"],
         false
     );
 }
@@ -453,10 +531,7 @@ fn missing_extra_and_wrong_typed_columns_do_not_commit_page() {
         let path = temp.path().join("db");
         let fake = Fake::new(&[("Card", 1)]);
         let mut s = fake.state.lock().unwrap();
-        let data = s.rows.get_mut("Card").unwrap()[0]
-            .data
-            .as_object_mut()
-            .unwrap();
+        let data = s.rows.get_mut("Card").unwrap()[0].as_object_mut().unwrap();
         match corrupt {
             "missing" => {
                 data.remove("WordCount");
@@ -561,11 +636,11 @@ fn all_five_dbo_tables_stage_real_columns_and_distinct_bit_and_int_flags() {
     assert_eq!(settings, None);
     let staged = StagedAccount::open(path).unwrap();
     assert_eq!(
-        staged.read_rows("Speare_WorkspaceTrees", 0, 1).unwrap()[0].data["NodeHidden"],
+        staged.read_rows("Speare_WorkspaceTrees", None, 1).unwrap()[0].data["NodeHidden"],
         true
     );
     assert_eq!(
-        staged.read_rows("Speare_WorkspaceTrees", 0, 1).unwrap()[0].data["Deleted"],
+        staged.read_rows("Speare_WorkspaceTrees", None, 1).unwrap()[0].data["Deleted"],
         0
     );
 }

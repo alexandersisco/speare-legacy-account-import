@@ -7,7 +7,7 @@ fn main() {
     let input =
         fs::read_to_string("legacy-sql-server-schema.sql").expect("legacy schema reference");
     let mut output = String::from("pub(crate) static TABLES: &[Table] = &[\n");
-    let mut table: Option<String> = None;
+    let mut table: Option<(String, String)> = None;
     let mut columns = Vec::new();
     let mut tables = 0;
     let mut names = HashSet::new();
@@ -16,10 +16,13 @@ fn main() {
         if let Some(start) = line.strip_prefix("CREATE TABLE ") {
             assert!(table.is_none(), "nested table definition");
             let start = start.strip_prefix('[').expect("SQL Server schema name");
-            let (_schema, name) = start.split_once("].[").expect("SQL Server table header");
-            table = Some(name.split_once(']').expect("table name").0.to_owned());
+            let (schema, name) = start.split_once("].[").expect("SQL Server table header");
+            table = Some((
+                schema.to_owned(),
+                name.split_once(']').expect("table name").0.to_owned(),
+            ));
         } else if line == ");" && table.is_some() {
-            let name = table.take().unwrap();
+            let (schema, name) = table.take().unwrap();
             assert!(
                 names.insert(name.clone()),
                 "duplicate table name {name} across SQL schemas; qualify dataset names first"
@@ -32,7 +35,8 @@ fn main() {
             );
             writeln!(
                 output,
-                "    Table {{ name: {name:?}, columns: &[{}] }},",
+                "    Table {{ name: {name:?}, source_table: {:?}, columns: &[{}] }},",
+                format!("{schema}.{name}"),
                 columns.join(", ")
             )
             .unwrap();
@@ -58,13 +62,14 @@ fn main() {
             } else {
                 panic!(
                     "unsupported SQL type in {}.{}: {rest}",
-                    table.as_ref().unwrap(),
+                    table.as_ref().unwrap().1,
                     name
                 )
             };
             let nullable = !rest.contains("NOT NULL");
             columns.push(format!(
-                "Column {{ name: {name:?}, kind: Kind::{kind}, nullable: {nullable} }}"
+                "Column {{ name: {name:?}, source_type: {:?}, kind: Kind::{kind}, nullable: {nullable} }}",
+                rest.split_whitespace().next().unwrap()
             ));
         }
     }

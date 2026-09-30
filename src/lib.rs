@@ -9,7 +9,9 @@ mod staging;
 
 pub use acquisition::{Acquirer, AcquisitionOptions, Progress};
 pub use http::HttpLegacySource;
-pub use source::{Dataset, LegacySource, Manifest, Page, SourceError, SourceRow};
+pub use source::{
+    Dataset, Field, LegacySource, Manifest, Page, Pagination, SourceError, SourceRow,
+};
 pub use staging::{StagedAccount, StagedDataset, StagedRow};
 
 /// Every V4 (`dbo`) and V5 (`andrew`) dataset required in a complete server manifest.

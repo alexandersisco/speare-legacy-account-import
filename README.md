@@ -2,8 +2,8 @@
 
 Rust library for acquiring a durable local copy of a legacy Speare account. It does **not**
 connect to SQL Server or convert the rows into the current Speare model. See
-[`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md) for boundaries and [`MIGRATION_API.md`](MIGRATION_API.md)
-for the proposed, not-yet-implemented server contract and its consistency precondition.
+[`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md) for boundaries and
+[`docs/importer-api-contract.md`](docs/importer-api-contract.md) for the approved exporter API.
 The staging SQLite file has tables named for the legacy tables, with the columns and compatible
 SQLite types generated from `legacy-sql-server-schema.sql`. Every V4 (`dbo`) and V5 (`andrew`)
 table in that reference is required in the server manifest, including empty tables. Acquisition
@@ -14,22 +14,30 @@ use speare_legacy_account_import::{Acquirer, HttpLegacySource, StagedAccount};
 
 # fn example() -> Result<(), Box<dyn std::error::Error>> {
 let source = HttpLegacySource::new("https://speare.example/", "account-scoped-token")?;
-let progress = Acquirer::new(source).acquire("legacy-user-id", "account.stage.sqlite")?;
+let progress = Acquirer::new(source).acquire(
+    "legacy-user-id",
+    "local-migration-run-id",
+    "account.stage.sqlite",
+)?;
 assert!(progress.complete);
 
 let staged = StagedAccount::open("account.stage.sqlite")?;
-let mut after_id = 0;
+let mut after_id = None;
 loop {
     let rows = staged.read_rows("Card", after_id, 100)?;
     if rows.is_empty() { break; }
     for row in rows {
-        after_id = row.id;
+        after_id = Some(row.id);
         // Transform this legacy row in speare-account-import, not this library.
     }
 }
 # Ok(())
 # }
 ```
+
+`HttpLegacySource::new` uses the exporter's default `/v1` prefix. Use
+`HttpLegacySource::with_endpoint_prefix` for mounts such as `/api/migration/export/v1`, or
+`with_authenticated_client` to use authentication configured by the surrounding application.
 
 Reinvoke `acquire` with the same path after interruption; committed pages are not fetched again.
 Open a completed staging file without the network for downstream reruns. Store it in an

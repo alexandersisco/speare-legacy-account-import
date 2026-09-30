@@ -50,17 +50,27 @@ impl<S: LegacySource> Acquirer<S> {
         Ok(Self { source, options })
     }
 
-    /// Run or resume an export at `path`. An error leaves all committed pages available for
-    /// another call, including after a process restart. Keep one staging file per account.
-    pub fn acquire(&self, account_id: &str, path: impl AsRef<Path>) -> Result<Progress> {
-        if account_id.is_empty() {
-            return Err(Error::Invalid("empty account ID".into()));
+    /// Run or resume one local migration run at `path`. Reuse the same run ID after an
+    /// interruption; use a new run ID and staging file after the source write barrier lapses.
+    pub fn acquire(
+        &self,
+        account_id: &str,
+        migration_run_id: &str,
+        path: impl AsRef<Path>,
+    ) -> Result<Progress> {
+        if account_id.is_empty() || migration_run_id.is_empty() {
+            return Err(Error::Invalid("empty account or migration-run ID".into()));
         }
         let mut staged = StagedAccount::create(path)?;
         if let Some(existing) = staged.account_id()? {
             if existing != account_id {
                 return Err(Error::Conflict(
                     "staging file belongs to another account".into(),
+                ));
+            }
+            if staged.migration_run_id()?.as_deref() != Some(migration_run_id) {
+                return Err(Error::Conflict(
+                    "staging file belongs to another migration run".into(),
                 ));
             }
             if staged.is_complete()? {
@@ -70,9 +80,9 @@ impl<S: LegacySource> Acquirer<S> {
                 });
             }
         }
-        let manifest = self.retry(|| self.source.manifest(account_id))?;
-        validate_manifest(&manifest, account_id)?;
-        staged.initialize(&manifest)?;
+        let manifest = self.retry(|| self.source.manifest())?;
+        validate_manifest(&manifest)?;
+        staged.initialize(account_id, migration_run_id, &manifest)?;
         for dataset in &manifest.datasets {
             let (mut after_id, mut count, complete) = staged.checkpoint(&dataset.name)?;
             if complete {
@@ -80,28 +90,19 @@ impl<S: LegacySource> Acquirer<S> {
             }
             loop {
                 let page = self.retry(|| {
-                    self.source.page(
-                        account_id,
-                        &manifest.export_id,
-                        &dataset.name,
-                        after_id,
-                        self.options.page_size,
-                    )
+                    self.source
+                        .page(&dataset.name, after_id, self.options.page_size)
                 })?;
                 validate_page(dataset, after_id, count, &page, self.options.page_size)?;
                 staged.persist_page(dataset, after_id, &page)?;
                 count += page.rows.len() as u64;
-                if let Some(last) = page.rows.last() {
-                    after_id = last.id;
-                }
+                after_id = page.next_after_id;
                 if page.complete {
                     break;
                 }
             }
         }
-        // Detect an invalidated view before declaring success. The server must also honor its
-        // export_id contract: rechecking counts alone cannot detect in-place row edits.
-        let current = self.retry(|| self.source.manifest(account_id))?;
+        let current = self.retry(|| self.source.manifest())?;
         if current != manifest {
             return Err(Error::Conflict(
                 "source export changed during acquisition".into(),
@@ -128,21 +129,34 @@ impl<S: LegacySource> Acquirer<S> {
     }
 }
 
-fn validate_manifest(m: &Manifest, requested: &str) -> Result<()> {
-    if m.account_id != requested || m.export_id.is_empty() || m.datasets.is_empty() {
+fn validate_manifest(m: &Manifest) -> Result<()> {
+    if m.datasets.is_empty()
+        || m.pagination.default_limit != 100
+        || m.pagination.max_limit != 1000
+        || m.pagination.continuation != "exclusive after_id"
+        || m.consistency != "application-quiesced"
+    {
         return Err(Error::Invalid(
-            "manifest has wrong account, empty export ID, or no datasets".into(),
+            "invalid manifest pagination or consistency contract".into(),
         ));
     }
     let mut names = HashSet::new();
     for d in &m.datasets {
-        legacy_schema::table(&d.name)?;
+        let table = legacy_schema::table(&d.name)?;
         if d.name.is_empty()
             || !names.insert(d.name.as_str())
+            || d.source_table != table.source_table
+            || d.ownership.is_empty()
+            || d.key != "Id"
+            || d.order != "ascending"
+            || (d.row_count == 0) != d.max_id.is_none()
             || d.row_count > i64::MAX as u64
-            || (d.row_count == 0 && d.max_id != 0)
-            || (d.row_count > 0 && d.max_id <= 0)
-            || (d.max_id > 0 && d.row_count > d.max_id as u64)
+            || d.fields.len() != table.columns.len()
+            || d.fields.iter().zip(table.columns).any(|(field, column)| {
+                field.name != column.name
+                    || !field.source_type.eq_ignore_ascii_case(column.source_type)
+                    || field.nullable != column.nullable
+            })
         {
             return Err(Error::Invalid(format!(
                 "invalid dataset descriptor: {}",
@@ -161,10 +175,27 @@ fn validate_manifest(m: &Manifest, requested: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_page(d: &Dataset, after: i64, count: u64, p: &Page, limit: usize) -> Result<()> {
+fn row_id(row: &serde_json::Value) -> Option<i32> {
+    row.as_object()
+        .and_then(|object| object.get("Id"))
+        .and_then(|value| value.as_i64())
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+fn validate_page(
+    d: &Dataset,
+    after: Option<i32>,
+    count: u64,
+    p: &Page,
+    limit: usize,
+) -> Result<()> {
+    let new_count = count.saturating_add(p.rows.len() as u64);
     if p.rows.len() > limit
+        || p.dataset != d.name
         || (!p.complete && p.rows.is_empty())
-        || count.saturating_add(p.rows.len() as u64) > d.row_count
+        || new_count > d.row_count
+        || (!p.complete && new_count == d.row_count)
+        || (p.complete && p.next_after_id.is_some())
     {
         return Err(Error::Invalid(format!(
             "invalid page size or count for {}",
@@ -173,23 +204,24 @@ fn validate_page(d: &Dataset, after: i64, count: u64, p: &Page, limit: usize) ->
     }
     let mut last = after;
     for row in &p.rows {
-        if row.id <= last
-            || row.id > d.max_id
-            || row
-                .data
-                .as_object()
-                .and_then(|o| o.get("Id"))
-                .and_then(|v| v.as_i64())
-                != Some(row.id)
-        {
+        let Some(id) = row_id(row) else {
+            return Err(Error::Invalid(format!("invalid row Id in {}", d.name)));
+        };
+        if last.is_some_and(|previous| id <= previous) || d.max_id.is_some_and(|max| id > max) {
             return Err(Error::Invalid(format!(
                 "invalid row Id or order in {}",
                 d.name
             )));
         }
-        last = row.id;
+        last = Some(id);
     }
-    if p.complete && (count + p.rows.len() as u64 != d.row_count || last != d.max_id) {
+    if !p.complete && p.next_after_id != last {
+        return Err(Error::Invalid(format!(
+            "invalid continuation in {}",
+            d.name
+        )));
+    }
+    if p.complete && (new_count != d.row_count || last.or(after) != d.max_id) {
         return Err(Error::Invalid(format!(
             "premature completion in {}",
             d.name

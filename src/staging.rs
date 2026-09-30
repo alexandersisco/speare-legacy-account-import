@@ -21,7 +21,7 @@ pub struct StagedDataset {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StagedRow {
-    pub id: i64,
+    pub id: i32,
     pub data: serde_json::Value,
 }
 
@@ -31,7 +31,7 @@ impl StagedAccount {
         let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         configure(&db)?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != 1 {
+        if version != 2 {
             return Err(Error::Conflict(format!(
                 "unsupported staging schema version {version}"
             )));
@@ -43,7 +43,7 @@ impl StagedAccount {
         let db = Connection::open(path)?;
         configure(&db)?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != 0 && version != 1 {
+        if version != 0 && version != 2 {
             return Err(Error::Conflict(format!(
                 "unsupported staging schema version {version}"
             )));
@@ -54,13 +54,14 @@ impl StagedAccount {
                 db.execute_batch(
                 "
                  CREATE TABLE export (id INTEGER PRIMARY KEY CHECK (id = 1), account_id TEXT NOT NULL,
-                     manifest_json TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0);
+                      migration_run_id TEXT NOT NULL, manifest_json TEXT NOT NULL,
+                      complete INTEGER NOT NULL DEFAULT 0);
                  CREATE TABLE datasets (name TEXT PRIMARY KEY, expected_rows INTEGER NOT NULL,
-                     max_id INTEGER NOT NULL, acquired_rows INTEGER NOT NULL DEFAULT 0,
-                     last_id INTEGER NOT NULL DEFAULT 0, complete INTEGER NOT NULL DEFAULT 0);",
+                      max_id INTEGER, acquired_rows INTEGER NOT NULL DEFAULT 0,
+                      last_id INTEGER, complete INTEGER NOT NULL DEFAULT 0);",
                 )?;
                 legacy_schema::create_tables(&db)?;
-                db.execute_batch("PRAGMA user_version = 1;")?;
+                db.execute_batch("PRAGMA user_version = 2;")?;
                 Ok(())
             })();
             if let Err(e) = creation {
@@ -76,6 +77,15 @@ impl StagedAccount {
         Ok(self
             .db
             .query_row("SELECT account_id FROM export WHERE id=1", [], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn migration_run_id(&self) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row("SELECT migration_run_id FROM export WHERE id=1", [], |r| {
+                r.get(0)
+            })
             .optional()?)
     }
 
@@ -106,14 +116,17 @@ impl StagedAccount {
 
     /// A bounded page for downstream transformation. Only complete exports may be read.
     /// Repeated calls with the last returned Id allow incremental processing.
-    pub fn read_rows(&self, dataset: &str, after_id: i64, limit: usize) -> Result<Vec<StagedRow>> {
+    pub fn read_rows(
+        &self,
+        dataset: &str,
+        after_id: Option<i32>,
+        limit: usize,
+    ) -> Result<Vec<StagedRow>> {
         if !self.is_complete()? {
             return Err(Error::Incomplete);
         }
-        if !(1..=1000).contains(&limit) || after_id < 0 {
-            return Err(Error::Invalid(
-                "read limit must be 1..=1000 and after_id nonnegative".into(),
-            ));
+        if !(1..=1000).contains(&limit) {
+            return Err(Error::Invalid("read limit must be 1..=1000".into()));
         }
         if self
             .db
@@ -128,10 +141,18 @@ impl StagedAccount {
             return Err(Error::Invalid(format!("unknown dataset {dataset}")));
         }
         let table = legacy_schema::table(dataset)?;
-        let mut stmt = self.db.prepare(&format!(
-            "SELECT * FROM {} WHERE \"Id\">?1 ORDER BY \"Id\" LIMIT ?2",
-            quoted(table.name)
-        ))?;
+        let sql = if after_id.is_some() {
+            format!(
+                "SELECT * FROM {} WHERE \"Id\">?1 ORDER BY \"Id\" LIMIT ?2",
+                quoted(table.name)
+            )
+        } else {
+            format!(
+                "SELECT * FROM {} ORDER BY \"Id\" LIMIT ?2",
+                quoted(table.name)
+            )
+        };
+        let mut stmt = self.db.prepare(&sql)?;
         let mut rows = stmt.query(params![after_id, limit as i64])?;
         let mut result = Vec::new();
         while let Some(row) = rows.next()? {
@@ -141,6 +162,7 @@ impl StagedAccount {
             let data = legacy_schema::json_row(table, values)?;
             let id = data["Id"]
                 .as_i64()
+                .and_then(|id| i32::try_from(id).ok())
                 .ok_or_else(|| Error::Conflict("staged Id is invalid".into()))?;
             result.push(StagedRow { id, data });
         }
@@ -161,7 +183,12 @@ impl StagedAccount {
         .transpose()
     }
 
-    pub(crate) fn initialize(&mut self, manifest: &Manifest) -> Result<()> {
+    pub(crate) fn initialize(
+        &mut self,
+        account_id: &str,
+        migration_run_id: &str,
+        manifest: &Manifest,
+    ) -> Result<()> {
         if let Some(existing) = self.manifest()? {
             if existing != *manifest {
                 return Err(Error::Conflict("source manifest changed; keep the existing file for diagnosis and start a new export in a new file".into()));
@@ -172,9 +199,10 @@ impl StagedAccount {
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
-            "INSERT INTO export (id, account_id, manifest_json) VALUES (1, ?1, ?2)",
+            "INSERT INTO export (id, account_id, migration_run_id, manifest_json) VALUES (1, ?1, ?2, ?3)",
             params![
-                manifest.account_id,
+                account_id,
+                migration_run_id,
                 serde_json::to_string(manifest).map_err(|e| Error::Invalid(e.to_string()))?
             ],
         )?;
@@ -188,8 +216,8 @@ impl StagedAccount {
         Ok(())
     }
 
-    pub(crate) fn checkpoint(&self, name: &str) -> Result<(i64, u64, bool)> {
-        let (id, count, complete): (i64, i64, bool) = self.db.query_row(
+    pub(crate) fn checkpoint(&self, name: &str) -> Result<(Option<i32>, u64, bool)> {
+        let (id, count, complete): (Option<i32>, i64, bool) = self.db.query_row(
             "SELECT last_id, acquired_rows, complete FROM datasets WHERE name=?1",
             [name],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -200,13 +228,13 @@ impl StagedAccount {
     pub(crate) fn persist_page(
         &mut self,
         dataset: &Dataset,
-        old_id: i64,
+        old_id: Option<i32>,
         page: &Page,
     ) -> Result<()> {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let (actual_id, count, complete): (i64, i64, bool) = tx.query_row(
+        let (actual_id, count, complete): (Option<i32>, i64, bool) = tx.query_row(
             "SELECT last_id, acquired_rows, complete FROM datasets WHERE name=?1",
             [&dataset.name],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -234,9 +262,12 @@ impl StagedAccount {
         );
         let mut stmt = tx.prepare(&sql)?;
         for row in &page.rows {
-            let values = legacy_schema::sql_values(table, &row.data)?;
+            let values = legacy_schema::sql_values(table, row)?;
             stmt.execute(params_from_iter(values))?;
-            last = row.id;
+            last = row
+                .get("Id")
+                .and_then(|value| value.as_i64())
+                .and_then(|value| i32::try_from(value).ok());
         }
         drop(stmt);
         let new_count = count + page.rows.len() as i64;
@@ -267,24 +298,27 @@ impl StagedAccount {
     }
 
     fn validate_checkpoint(&self) -> Result<()> {
-        let mut stmt = self
-            .db
-            .prepare("SELECT name, acquired_rows, last_id FROM datasets")?;
+        let mut stmt = self.db.prepare(
+            "SELECT name, expected_rows, max_id, acquired_rows, last_id, complete FROM datasets",
+        )?;
         let mut result = stmt.query([])?;
         while let Some(row) = result.next()? {
             let name: String = row.get(0)?;
-            let expected: i64 = row.get(1)?;
-            let last: i64 = row.get(2)?;
+            let expected_rows: i64 = row.get(1)?;
+            let expected_max: Option<i32> = row.get(2)?;
+            let acquired: i64 = row.get(3)?;
+            let last: Option<i32> = row.get(4)?;
+            let complete: bool = row.get(5)?;
             let table = legacy_schema::table(&name)?;
-            let (actual, max): (i64, i64) = self.db.query_row(
-                &format!(
-                    "SELECT count(*), coalesce(max(\"Id\"), 0) FROM {}",
-                    quoted(table.name)
-                ),
+            let (actual, max): (i64, Option<i32>) = self.db.query_row(
+                &format!("SELECT count(*), max(\"Id\") FROM {}", quoted(table.name)),
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            if expected != actual || last != max {
+            if acquired != actual
+                || last != max
+                || (complete && (expected_rows != actual || expected_max != max))
+            {
                 return Err(Error::Conflict(format!(
                     "staged checkpoint differs from rows for {name}"
                 )));

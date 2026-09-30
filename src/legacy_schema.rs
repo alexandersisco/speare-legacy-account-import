@@ -12,12 +12,14 @@ pub(crate) enum Kind {
 
 pub(crate) struct Column {
     pub name: &'static str,
+    pub source_type: &'static str,
     pub kind: Kind,
     pub nullable: bool,
 }
 
 pub(crate) struct Table {
     pub name: &'static str,
+    pub source_table: &'static str,
     pub columns: &'static [Column],
 }
 
